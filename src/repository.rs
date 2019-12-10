@@ -28,7 +28,6 @@ use crate::metadata::{
 };
 use crate::util::SafeReader;
 use crate::Result;
-use url::Url;
 
 /// Top-level trait that represents a TUF repository and contains all the ways it can be interacted
 /// with.
@@ -372,7 +371,7 @@ where
     C: Connect + Sync + 'static,
     D: DataInterchange,
 {
-    url: Url,
+    uri: Uri,
     client: Client<C>,
     interchange: PhantomData<D>,
     user_agent: Option<String>,
@@ -387,9 +386,9 @@ where
     D: DataInterchange,
 {
     /// Create a new repository with the given `Url` and `Client`.
-    pub fn new(url: Url, client: Client<C>) -> Self {
+    pub fn new(uri: Uri, client: Client<C>) -> Self {
         HttpRepositoryBuilder {
-            url: url,
+            uri: uri,
             client: client,
             interchange: PhantomData,
             user_agent: None,
@@ -443,7 +442,7 @@ where
         };
 
         HttpRepository {
-            url: self.url,
+            uri: self.uri,
             client: self.client,
             interchange: self.interchange,
             user_agent: user_agent,
@@ -460,7 +459,7 @@ where
     C: Connect + Sync + 'static,
     D: DataInterchange,
 {
-    url: Url,
+    uri: Uri,
     client: Client<C>,
     user_agent: String,
     metadata_prefix: Option<Vec<String>>,
@@ -479,21 +478,89 @@ where
         prefix: &'a Option<Vec<String>>,
         components: &'a [String],
     ) -> Result<Response<Body>> {
-        let mut url = self.url.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|_| {
-                Error::IllegalArgument(format!("URL was 'cannot-be-a-base': {:?}", self.url))
-            })?;
-            if let Some(ref prefix) = prefix {
-                segments.extend(prefix);
+        let uri = self.uri.clone();
+
+        /*
+        let mut uri_parts = uri.into_parts();
+        let (path, query) = match &uri_parts.path_and_query {
+            Some(path_and_query) => {
+                // Remove a trailing slash from path, if any.
+                let mut modified_path = path_and_query.path().to_owned();
+                if modified_path.ends_with('/') {
+                    modified_path.pop();
+                }
+                (modified_path, path_and_query.query())
             }
-            segments.extend(components);
+            None => return Err(BlobUrlError::UriWithoutPath),
+        };
+        // Add the merkle string to the end of the path.
+        // There isn't a way to reconstruct a PathAndQuery by its struct members,
+        // so we have to use format and then parse from a string...
+        uri_parts.path_and_query = if let Some(query) = query {
+            Some(format!("{}/{}?{}", path, &merkle, query).parse()?)
+        } else {
+            Some(format!("{}/{}", path, &merkle).parse()?)
+        };
+
+        Ok(Uri::from_parts(uri_parts)?)
+             */
+
+        let mut uri_parts = uri.into_parts();
+        let path = uri.path();
+        let modified_path = path.to_owned();
+
+        if modified_path.ends_with("/") {
+            modified_path.pop();
         }
 
-        let uri: Uri = url.into_string().parse().map_err(|_| {
-            Error::IllegalArgument(format!("URL was 'cannot-be-a-base': {:?}", self.url))
-        })?;
+        let mut path_split: Vec<String> = modified_path.split("/").map(String::from).collect();
 
+        if let Some(ref prefix) = prefix {
+            path_split.extend(prefix.iter().cloned());
+        }
+        path_split.append(&mut components.to_vec());
+
+        // TODO(wittrock): urlencode items.
+        let constructed_path = path_split.join("/");
+
+        let query = if let Some(path_and_query) = uri_parts.path_and_query {
+            path_and_query.query()
+        } else {
+            None
+        };
+
+        uri_parts.path_and_query = if let Some(query) = query {
+            Some(
+                format!("{}?{}", constructed_path, query)
+                    .parse()
+                    .map_err(|_| {
+                        Error::IllegalArgument(format!(
+                            "Invalid path and query: {:?}, {:?}",
+                            constructed_path, query
+                        ))
+                    })?,
+            )
+        } else {
+            Some(constructed_path.parse().map_err(|_| {
+                Error::IllegalArgument(format!("Invalid URI path: {:?}", constructed_path))
+            })?)
+        };
+
+        let uri = Uri::from_parts(uri_parts)
+            .map_err(|_| Error::IllegalArgument(format!("Invalid URI parts: {:?}", uri_parts)))?;
+
+        /* TODO(wittrock)
+                let mut url = self.url.clone();
+                {
+                    let mut segments = url.path_segments_mut().map_err(|_| {
+                        Error::IllegalArgument(format!("URL was 'cannot-be-a-base': {:?}", self.url))
+                    })?;
+                    if let Some(ref prefix) = prefix {
+                        segments.extend(prefix);
+                    }
+                    segments.extend(components);
+                }
+        */
         let req = Request::builder()
             .uri(uri)
             .header("User-Agent", &*self.user_agent)
@@ -508,7 +575,7 @@ where
             } else {
                 Err(Error::Opaque(format!(
                     "Error getting {:?}: {:?}",
-                    self.url, resp
+                    self.uri, resp
                 )))
             }
         } else {
