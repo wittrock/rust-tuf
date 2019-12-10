@@ -506,9 +506,13 @@ where
              */
 
         let mut uri_parts = uri.into_parts();
-        let path = uri.path();
-        let modified_path = path.to_owned();
 
+        let (path, query) = match &uri_parts.path_and_query {
+            Some(path_and_query) => (path_and_query.path(), path_and_query.query()),
+            None => ("", None),
+        };
+
+        let mut modified_path = path.to_owned();
         if modified_path.ends_with("/") {
             modified_path.pop();
         }
@@ -522,12 +526,6 @@ where
 
         // TODO(wittrock): urlencode items.
         let constructed_path = path_split.join("/");
-
-        let query = if let Some(path_and_query) = uri_parts.path_and_query {
-            path_and_query.query()
-        } else {
-            None
-        };
 
         uri_parts.path_and_query = if let Some(query) = query {
             Some(
@@ -546,8 +544,12 @@ where
             })?)
         };
 
-        let uri = Uri::from_parts(uri_parts)
-            .map_err(|_| Error::IllegalArgument(format!("Invalid URI parts: {:?}", uri_parts)))?;
+        let uri = Uri::from_parts(uri_parts).map_err(|_| {
+            Error::IllegalArgument(format!(
+                "Invalid URI parts: {:?}, {:?}, {:?}",
+                constructed_path, prefix, components
+            ))
+        })?;
 
         /* TODO(wittrock)
                 let mut url = self.url.clone();
