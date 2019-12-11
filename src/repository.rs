@@ -12,6 +12,7 @@ use hyper::Client;
 use hyper::Request;
 use log::debug;
 use parking_lot::RwLock;
+use percent_encoding::utf8_percent_encode;
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File};
 use std::io;
@@ -468,43 +469,32 @@ where
     interchange: PhantomData<D>,
 }
 
+// Configuration for urlencoding URI path elements.
+// From https://url.spec.whatwg.org/#path-percent-encode-set
+const URLENCODE_FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`');
+const URLENCODE_PATH: &percent_encoding::AsciiSet = &URLENCODE_FRAGMENT
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'=')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
+
 impl<C, D> HttpRepository<C, D>
 where
     C: Connect + Sync + 'static,
     D: DataInterchange,
 {
-    async fn get<'a>(
-        &'a self,
-        prefix: &'a Option<Vec<String>>,
-        components: &'a [String],
-    ) -> Result<Response<Body>> {
-        let uri = self.uri.clone();
-
-        /*
-        let mut uri_parts = uri.into_parts();
-        let (path, query) = match &uri_parts.path_and_query {
-            Some(path_and_query) => {
-                // Remove a trailing slash from path, if any.
-                let mut modified_path = path_and_query.path().to_owned();
-                if modified_path.ends_with('/') {
-                    modified_path.pop();
-                }
-                (modified_path, path_and_query.query())
-            }
-            None => return Err(BlobUrlError::UriWithoutPath),
-        };
-        // Add the merkle string to the end of the path.
-        // There isn't a way to reconstruct a PathAndQuery by its struct members,
-        // so we have to use format and then parse from a string...
-        uri_parts.path_and_query = if let Some(query) = query {
-            Some(format!("{}/{}?{}", path, &merkle, query).parse()?)
-        } else {
-            Some(format!("{}/{}", path, &merkle).parse()?)
-        };
-
-        Ok(Uri::from_parts(uri_parts)?)
-             */
-
+    fn extend_uri(uri: Uri, prefix: &Option<Vec<String>>, components: &[String]) -> Result<Uri> {
         let mut uri_parts = uri.into_parts();
 
         let (path, query) = match &uri_parts.path_and_query {
@@ -518,51 +508,52 @@ where
         }
 
         let mut path_split: Vec<String> = modified_path.split("/").map(String::from).collect();
+        let mut new_path_elements: Vec<String> = vec![];
 
         if let Some(ref prefix) = prefix {
-            path_split.extend(prefix.iter().cloned());
+            new_path_elements.extend(prefix.iter().cloned());
         }
-        path_split.append(&mut components.to_vec());
+        new_path_elements.append(&mut components.to_vec());
 
-        // TODO(wittrock): urlencode items.
+        // Urlencode new items to match behavior of PathSegmentsMut.extend
+        let encoded_new_path_elements: Vec<String> = new_path_elements
+            .into_iter()
+            .map(|path_segment| utf8_percent_encode(&path_segment, URLENCODE_PATH).collect())
+            .collect();
+
+        path_split.extend(encoded_new_path_elements);
         let constructed_path = path_split.join("/");
 
-        uri_parts.path_and_query = if let Some(query) = query {
-            Some(
-                format!("{}?{}", constructed_path, query)
-                    .parse()
-                    .map_err(|_| {
-                        Error::IllegalArgument(format!(
-                            "Invalid path and query: {:?}, {:?}",
-                            constructed_path, query
-                        ))
-                    })?,
-            )
-        } else {
-            Some(constructed_path.parse().map_err(|_| {
+        uri_parts.path_and_query = match query {
+            Some(query) => Some(format!("{}?{}", constructed_path, query).parse().map_err(
+                |_| {
+                    Error::IllegalArgument(format!(
+                        "Invalid path and query: {:?}, {:?}",
+                        constructed_path, query
+                    ))
+                },
+            )?),
+            None => Some(constructed_path.parse().map_err(|_| {
                 Error::IllegalArgument(format!("Invalid URI path: {:?}", constructed_path))
-            })?)
+            })?),
         };
 
-        let uri = Uri::from_parts(uri_parts).map_err(|_| {
+        Ok(Uri::from_parts(uri_parts).map_err(|_| {
             Error::IllegalArgument(format!(
                 "Invalid URI parts: {:?}, {:?}, {:?}",
                 constructed_path, prefix, components
             ))
-        })?;
+        })?)
+    }
 
-        /* TODO(wittrock)
-                let mut url = self.url.clone();
-                {
-                    let mut segments = url.path_segments_mut().map_err(|_| {
-                        Error::IllegalArgument(format!("URL was 'cannot-be-a-base': {:?}", self.url))
-                    })?;
-                    if let Some(ref prefix) = prefix {
-                        segments.extend(prefix);
-                    }
-                    segments.extend(components);
-                }
-        */
+    async fn get<'a>(
+        &'a self,
+        prefix: &'a Option<Vec<String>>,
+        components: &'a [String],
+    ) -> Result<Response<Body>> {
+        let base_uri = self.uri.clone();
+        let uri = HttpRepository::<C, D>::extend_uri(base_uri, prefix, components)?;
+
         let req = Request::builder()
             .uri(uri)
             .header("User-Agent", &*self.user_agent)
